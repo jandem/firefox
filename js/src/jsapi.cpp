@@ -3677,20 +3677,18 @@ JS_PUBLIC_API bool JS_StringifyWithLengthHint(JSContext* cx,
   AssertHeapIsIdle();
   CHECK_THREAD(cx);
   cx->check(replacer, space);
-  StringBuilder sb(cx);
-  if (!sb.ensureTwoByteChars()) {
-    return false;
-  }
-  if (lengthHint && !sb.reserve(lengthHint)) {
-    return false;
-  }
+  SegmentedStringBuilder sb(cx);
   if (!Stringify(cx, vp, replacer, space, sb, StringifyBehavior::Normal)) {
     return false;
   }
   if (sb.empty() && !sb.append(cx->names().null)) {
     return false;
   }
-  return callback(sb.rawTwoByteBegin(), sb.length(), data);
+  SegmentedStringBuilder::TwoByteCharsVector result(cx);
+  if (!sb.copyData(result)) {
+    return false;
+  }
+  return callback(result.begin(), result.length(), data);
 }
 
 JS_PUBLIC_API bool JS::ToJSON(JSContext* cx, HandleValue value,
@@ -3699,10 +3697,7 @@ JS_PUBLIC_API bool JS::ToJSON(JSContext* cx, HandleValue value,
   AssertHeapIsIdle();
   CHECK_THREAD(cx);
   cx->check(replacer, space);
-  StringBuilder sb(cx);
-  if (!sb.ensureTwoByteChars()) {
-    return false;
-  }
+  SegmentedStringBuilder sb(cx);
   RootedValue v(cx, value);
   if (!Stringify(cx, &v, replacer, space, sb, StringifyBehavior::Normal)) {
     return false;
@@ -3710,7 +3705,11 @@ JS_PUBLIC_API bool JS::ToJSON(JSContext* cx, HandleValue value,
   if (sb.empty()) {
     return true;
   }
-  return callback(sb.rawTwoByteBegin(), sb.length(), data);
+  SegmentedStringBuilder::TwoByteCharsVector result(cx);
+  if (!sb.copyData(result)) {
+    return false;
+  }
+  return callback(result.begin(), result.length(), data);
 }
 
 JS_PUBLIC_API bool JS::ToJSONMaybeSafely(JSContext* cx, JS::HandleObject input,
@@ -3720,11 +3719,7 @@ JS_PUBLIC_API bool JS::ToJSONMaybeSafely(JSContext* cx, JS::HandleObject input,
   CHECK_THREAD(cx);
   cx->check(input);
 
-  StringBuilder sb(cx);
-  if (!sb.ensureTwoByteChars()) {
-    return false;
-  }
-
+  SegmentedStringBuilder sb(cx);
   RootedValue inputValue(cx, ObjectValue(*input));
   if (!Stringify(cx, &inputValue, nullptr, NullHandleValue, sb,
                  StringifyBehavior::RestrictedSafe))
@@ -3734,7 +3729,11 @@ JS_PUBLIC_API bool JS::ToJSONMaybeSafely(JSContext* cx, JS::HandleObject input,
     return false;
   }
 
-  return callback(sb.rawTwoByteBegin(), sb.length(), data);
+  SegmentedStringBuilder::TwoByteCharsVector result(cx);
+  if (!sb.copyData(result)) {
+    return false;
+  }
+  return callback(result.begin(), result.length(), data);
 }
 
 JS_PUBLIC_API bool JS_ParseJSON(JSContext* cx, const char16_t* chars,

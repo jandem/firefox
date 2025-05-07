@@ -62,10 +62,10 @@ using JS::AutoStableStringChars;
  * Requires that the destination has enough space allocated for src after
  * escaping (that is, `2 + 6 * (srcEnd - srcBegin)` characters).
  */
-template <typename SrcCharT, typename DstCharT>
-static MOZ_ALWAYS_INLINE RangedPtr<DstCharT> InfallibleQuoteJSONString(
-    RangedPtr<const SrcCharT> srcBegin, RangedPtr<const SrcCharT> srcEnd,
-    RangedPtr<DstCharT> dstPtr) {
+template <typename SrcCharT>
+static bool QuoteJSONStringImpl(RangedPtr<const SrcCharT> srcBegin,
+                                RangedPtr<const SrcCharT> srcEnd,
+                                SegmentedStringBuilder& sb) {
   // Maps characters < 256 to the value that must follow the '\\' in the quoted
   // string. Entries with 'u' are handled as \\u00xy, and entries with 0 are not
   // escaped in any way. Characters >= 256 are all assumed to be unescaped.
@@ -85,11 +85,25 @@ static MOZ_ALWAYS_INLINE RangedPtr<DstCharT> InfallibleQuoteJSONString(
   };
 
   /* Step 1. */
-  *dstPtr++ = '"';
+  if (!sb.append('"')) {
+    return false;
+  }
 
   auto ToLowerHex = [](uint8_t u) {
     MOZ_ASSERT(u <= 0xF);
     return "0123456789abcdef"[u];
+  };
+
+  size_t numUnescaped = 0;
+  auto appendUnescaped = [&](size_t skipped) -> bool {
+    if (numUnescaped == 0) {
+      return true;
+    }
+    if (!sb.append((srcBegin - skipped - numUnescaped).get(), numUnescaped)) {
+      return false;
+    }
+    numUnescaped = 0;
+    return true;
   };
 
   /* Step 2. */
@@ -102,22 +116,34 @@ static MOZ_ALWAYS_INLINE RangedPtr<DstCharT> InfallibleQuoteJSONString(
 
       // Directly copy non-escaped code points.
       if (escaped == 0) {
-        *dstPtr++ = c;
+        numUnescaped++;
         continue;
       }
 
+      if (!appendUnescaped(1)) {
+        return false;
+      }
+
       // Escape the rest, elaborating Unicode escapes when needed.
-      *dstPtr++ = '\\';
-      *dstPtr++ = escaped;
+      if (!sb.append('\\')) {
+        return false;
+      }
+      if (!sb.append(escaped)) {
+        return false;
+      }
       if (escaped == 'u') {
-        *dstPtr++ = '0';
-        *dstPtr++ = '0';
+        if (!sb.append("00")) {
+          return false;
+        }
 
         uint8_t x = c >> 4;
         MOZ_ASSERT(x < 10);
-        *dstPtr++ = '0' + x;
-
-        *dstPtr++ = ToLowerHex(c & 0xF);
+        if (!sb.append(char('0' + x))) {
+          return false;
+        }
+        if (!sb.append(ToLowerHex(c & 0xF))) {
+          return false;
+        }
       }
 
       continue;
@@ -125,91 +151,101 @@ static MOZ_ALWAYS_INLINE RangedPtr<DstCharT> InfallibleQuoteJSONString(
 
     // Non-ASCII non-surrogates are directly copied.
     if (!unicode::IsSurrogate(c)) {
-      *dstPtr++ = c;
+      numUnescaped++;
       continue;
     }
 
     // So too for complete surrogate pairs.
     if (MOZ_LIKELY(unicode::IsLeadSurrogate(c) && srcBegin < srcEnd &&
                    unicode::IsTrailSurrogate(*srcBegin))) {
-      *dstPtr++ = c;
-      *dstPtr++ = *srcBegin++;
+      srcBegin++;
+      numUnescaped += 2;
       continue;
+    }
+
+    if (!appendUnescaped(1)) {
+      return false;
     }
 
     // But lone surrogates are Unicode-escaped.
     char32_t as32 = char32_t(c);
-    *dstPtr++ = '\\';
-    *dstPtr++ = 'u';
-    *dstPtr++ = ToLowerHex(as32 >> 12);
-    *dstPtr++ = ToLowerHex((as32 >> 8) & 0xF);
-    *dstPtr++ = ToLowerHex((as32 >> 4) & 0xF);
-    *dstPtr++ = ToLowerHex(as32 & 0xF);
+    if (!sb.append("\\u")) {
+      return false;
+    }
+    if (!sb.append(ToLowerHex(as32 >> 12))) {
+      return false;
+    }
+    if (!sb.append(ToLowerHex((as32 >> 8) & 0xF))) {
+      return false;
+    }
+    if (!sb.append(ToLowerHex((as32 >> 4) & 0xF))) {
+      return false;
+    }
+    if (!sb.append(ToLowerHex(as32 & 0xF))) {
+      return false;
+    }
+  }
+
+  if (!appendUnescaped(0)) {
+    return false;
   }
 
   /* Steps 3-4. */
-  *dstPtr++ = '"';
-  return dstPtr;
+  return sb.append('"');
 }
 
-template <typename SrcCharT, typename DstCharT>
-static size_t QuoteJSONStringHelper(const JSLinearString& linear,
-                                    StringBuilder& sb, size_t sbOffset) {
+template <typename SrcCharT>
+static bool QuoteJSONStringHelper(const JSLinearString& linear,
+                                  SegmentedStringBuilder& sb) {
   size_t len = linear.length();
 
   JS::AutoCheckCannotGC nogc;
   RangedPtr<const SrcCharT> srcBegin{linear.chars<SrcCharT>(nogc), len};
-  RangedPtr<DstCharT> dstBegin{sb.begin<DstCharT>(), sb.begin<DstCharT>(),
-                               sb.end<DstCharT>()};
-  RangedPtr<DstCharT> dstEnd =
-      InfallibleQuoteJSONString(srcBegin, srcBegin + len, dstBegin + sbOffset);
-
-  return dstEnd - dstBegin;
+  return QuoteJSONStringImpl(srcBegin, srcBegin + len, sb);
 }
 
-static bool QuoteJSONString(JSContext* cx, StringBuilder& sb, JSString* str) {
+template <typename CharT>
+static bool NeedsEscaping(const CharT* chars, size_t len) {
+  for (size_t i = 0; i < len; i++) {
+    CharT ch = chars[i];
+    if (std::is_same_v<CharT, Latin1Char> || ch <= 0xff) {
+      if (ch < 0x20 || ch == 0x22 || ch == 0x5C) {
+        return true;
+      }
+    } else {
+      if (!unicode::IsSurrogate(ch)) {
+        continue;
+      }
+      if (unicode::IsLeadSurrogate(ch) && i + 1 < len &&
+          unicode::IsTrailSurrogate(chars[i + 1])) {
+        i++;
+        continue;
+      }
+      return true;
+    }
+  }
+  return false;
+}
+
+static bool QuoteJSONString(JSContext* cx, SegmentedStringBuilder& sb,
+                            JSString* str) {
   JSLinearString* linear = str->ensureLinear(cx);
   if (!linear) {
     return false;
   }
 
-  if (linear->hasTwoByteChars() && !sb.ensureTwoByteChars()) {
-    return false;
-  }
-
-  // We resize the backing buffer to the maximum size we could possibly need,
-  // write the escaped string into it, and shrink it back to the size we ended
-  // up needing.
-
   size_t len = linear->length();
-  size_t sbInitialLen = sb.length();
-
-  CheckedInt<size_t> reservedLen = CheckedInt<size_t>(len) * 6 + 2;
-  if (MOZ_UNLIKELY(!reservedLen.isValid())) {
-    ReportAllocationOverflow(cx);
-    return false;
+  AutoCheckCannotGC nogc;
+  bool escape = str->hasLatin1Chars()
+                    ? NeedsEscaping(linear->latin1Chars(nogc), len)
+                    : NeedsEscaping(linear->twoByteChars(nogc), len);
+  if (MOZ_LIKELY(!escape)) {
+    return sb.append('"') && sb.append(linear) && sb.append('"');
   }
-
-  if (!sb.growByUninitialized(reservedLen.value())) {
-    return false;
-  }
-
-  size_t newSize;
-
   if (linear->hasTwoByteChars()) {
-    newSize =
-        QuoteJSONStringHelper<char16_t, char16_t>(*linear, sb, sbInitialLen);
-  } else if (sb.isUnderlyingBufferLatin1()) {
-    newSize = QuoteJSONStringHelper<Latin1Char, Latin1Char>(*linear, sb,
-                                                            sbInitialLen);
-  } else {
-    newSize =
-        QuoteJSONStringHelper<Latin1Char, char16_t>(*linear, sb, sbInitialLen);
+    return QuoteJSONStringHelper<char16_t>(*linear, sb);
   }
-
-  sb.shrinkTo(newSize);
-
-  return true;
+  return QuoteJSONStringHelper<Latin1Char>(*linear, sb);
 }
 
 namespace {
@@ -218,9 +254,9 @@ using ObjectVector = GCVector<JSObject*, 8>;
 
 class StringifyContext {
  public:
-  StringifyContext(JSContext* cx, StringBuilder& sb, const StringBuilder& gap,
-                   HandleObject replacer, const RootedIdVector& propertyList,
-                   bool maybeSafely)
+  StringifyContext(JSContext* cx, SegmentedStringBuilder& sb,
+                   const StringBuilder& gap, HandleObject replacer,
+                   const RootedIdVector& propertyList, bool maybeSafely)
       : sb(sb),
         gap(gap),
         replacer(cx, replacer),
@@ -232,7 +268,7 @@ class StringifyContext {
     MOZ_ASSERT_IF(maybeSafely, gap.empty());
   }
 
-  StringBuilder& sb;
+  SegmentedStringBuilder& sb;
   const StringBuilder& gap;
   RootedObject replacer;
   Rooted<ObjectVector> stack;
@@ -1039,7 +1075,8 @@ class OwnNonIndexKeysIterForJSON {
 };
 
 // Steps from https://262.ecma-international.org/14.0/#sec-serializejsonproperty
-static bool EmitSimpleValue(JSContext* cx, StringBuilder& sb, const Value& v) {
+static bool EmitSimpleValue(JSContext* cx, SegmentedStringBuilder& sb,
+                            const Value& v) {
   /* Step 8. */
   if (v.isString()) {
     return QuoteJSONString(cx, sb, v.toString());
@@ -1078,17 +1115,19 @@ static bool EmitSimpleValue(JSContext* cx, StringBuilder& sb, const Value& v) {
 
 // https://262.ecma-international.org/14.0/#sec-serializejsonproperty step 8b
 // where K is an integer index.
-static bool EmitQuotedIndexColon(StringBuilder& sb, uint32_t index) {
+static bool EmitQuotedIndexColon(SegmentedStringBuilder& sb, uint32_t index) {
   Int32ToCStringBuf cbuf;
   size_t cstrlen;
   const char* cstr = ::Int32ToCString(&cbuf, index, &cstrlen);
-  if (!sb.reserve(sb.length() + 1 + cstrlen + 1 + 1)) {
+  if (!sb.append('"')) {
     return false;
   }
-  sb.infallibleAppend('"');
-  sb.infallibleAppend(cstr, cstrlen);
-  sb.infallibleAppend('"');
-  sb.infallibleAppend(':');
+  if (!sb.append(cstr, cstrlen)) {
+    return false;
+  }
+  if (!sb.append("\":")) {
+    return false;
+  }
   return true;
 }
 
@@ -1457,7 +1496,7 @@ static bool FastSerializeJSONProperty(JSContext* cx, Handle<Value> v,
 
 /* https://262.ecma-international.org/14.0/#sec-json.stringify */
 bool js::Stringify(JSContext* cx, MutableHandleValue vp, JSObject* replacer_,
-                   const Value& space_, StringBuilder& sb,
+                   const Value& space_, SegmentedStringBuilder& sb,
                    StringifyBehavior stringifyBehavior) {
   RootedObject replacer(cx, replacer_);
   RootedValue space(cx, space_);
@@ -1652,10 +1691,11 @@ bool js::Stringify(JSContext* cx, MutableHandleValue vp, JSObject* replacer_,
         if (stringifyBehavior != StringifyBehavior::Compare) {
           return true;
         }
-        fastJSON = scx.sb.finishAtom();
+        MOZ_CRASH();
+        /*fastJSON = scx.sb.finishAtom();
         if (!fastJSON) {
           return false;
-        }
+        }*/
       }
       scx.sb.clear();  // Preserves allocated space.
     }
@@ -1685,7 +1725,8 @@ bool js::Stringify(JSContext* cx, MutableHandleValue vp, JSObject* replacer_,
 
   // For StringBehavior::Compare, when the fast path succeeded.
   if (MOZ_UNLIKELY(fastJSON)) {
-    JSAtom* slowJSON = scx.sb.finishAtom();
+    MOZ_CRASH();
+    /*JSAtom* slowJSON = scx.sb.finishAtom();
     if (!slowJSON) {
       return false;
     }
@@ -1695,7 +1736,7 @@ bool js::Stringify(JSContext* cx, MutableHandleValue vp, JSObject* replacer_,
     // Put the JSON back into the StringBuilder for returning.
     if (!sb.append(slowJSON)) {
       return false;
-    }
+    }*/
   }
 
   return true;
@@ -2084,12 +2125,12 @@ bool json_stringify(JSContext* cx, unsigned argc, Value* vp) {
   RootedValue space(cx, args.get(2));
 
 #ifdef DEBUG
-  StringifyBehavior behavior = StringifyBehavior::Compare;
+  StringifyBehavior behavior = StringifyBehavior::Normal;
 #else
   StringifyBehavior behavior = StringifyBehavior::Normal;
 #endif
 
-  JSStringBuilder sb(cx);
+  SegmentedStringBuilder sb(cx);
   if (!Stringify(cx, &value, replacer, space, sb, behavior)) {
     return false;
   }

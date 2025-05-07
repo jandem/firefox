@@ -533,6 +533,364 @@ inline bool BooleanToStringBuilder(bool b, StringBuilder& sb) {
   return b ? sb.append("true") : sb.append("false");
 }
 
+class MOZ_RAII SegmentedCharsWriter {
+ public:  // XXX
+  struct HeapSegment {
+    static constexpr size_t Capacity = 4096;
+    uint8_t bytes[Capacity];
+  };
+  struct StackSegment {
+    static constexpr size_t Capacity = 128;
+    uint8_t bytes[Capacity];
+  };
+  StackSegment segment;
+  Vector<UniquePtr<HeapSegment>, 8, SystemAllocPolicy> segments;
+
+  uint8_t* segmentCursor_;
+  uint8_t* segmentEnd_;
+
+  SegmentedCharsWriter() { clear(); }
+
+  size_t segmentBytesLeft() const {
+    MOZ_ASSERT(segmentCursor_ <= segmentEnd_);
+    return segmentEnd_ - segmentCursor_;
+  }
+
+  void clear() {
+    segmentCursor_ = segment.bytes;
+    segmentEnd_ = segmentCursor_ + StackSegment::Capacity;
+    segments.clear();
+  }
+  bool writeBytes(const uint8_t* bytes, size_t len) {
+    if (MOZ_LIKELY(canWriteBytesFast(len))) {
+      writeBytesFast(bytes, len);
+      return true;
+    }
+    return writeBytesSlow(bytes, len);
+  }
+  bool writeBytesSlow(const uint8_t* bytes, size_t len) {
+    const uint8_t* const bytesEnd = bytes + len;
+    MOZ_ASSERT(len > segmentBytesLeft());
+    memcpy(segmentCursor_, bytes, segmentBytesLeft());
+    bytes += segmentBytesLeft();
+    do {
+      MOZ_ASSERT(bytes < bytesEnd);
+      UniquePtr<HeapSegment> newSeg = MakeUnique<HeapSegment>();
+      if (!newSeg) {
+        return false;
+      }
+      segmentCursor_ = newSeg->bytes;
+      segmentEnd_ = segmentCursor_ + HeapSegment::Capacity;
+      if (!segments.append(std::move(newSeg))) {
+        return false;
+      }
+      size_t toWrite =
+          std::min<size_t>(HeapSegment::Capacity, bytesEnd - bytes);
+      memcpy(segmentCursor_, bytes, toWrite);
+      segmentCursor_ += toWrite;
+      bytes += toWrite;
+    } while (bytes < bytesEnd);
+    return true;
+  }
+  bool canWriteBytesFast(size_t len) const { return len <= segmentBytesLeft(); }
+  void writeBytesFast(const uint8_t* bytes, size_t len) {
+    MOZ_ASSERT(segmentCursor_ + len <= segmentEnd_);
+    memcpy(segmentCursor_, bytes, len);
+    segmentCursor_ += len;
+  }
+};
+
+class MOZ_RAII SegmentedCharsReader {
+  const SegmentedCharsWriter& writer_;
+  const uint8_t* segmentBytes_ = nullptr;
+  size_t segmentBytesLeft_ = 0;
+  size_t nextHeapSegment_ = 0;
+
+ public:
+  explicit SegmentedCharsReader(const SegmentedCharsWriter& writer)
+      : writer_(writer) {
+    segmentBytes_ = writer.segment.bytes;
+    segmentBytesLeft_ = writer.segment.Capacity;
+  }
+  template <typename F>
+  void readBytes(size_t numBytes, F&& f) {
+    while (true) {
+      MOZ_ASSERT(numBytes > 0);
+      if (segmentBytesLeft_ > 0) {
+        size_t toRead = std::min(numBytes, segmentBytesLeft_);
+        f(segmentBytes_, toRead);
+        numBytes -= toRead;
+        if (numBytes == 0) {
+          segmentBytes_ += toRead;
+          segmentBytesLeft_ -= toRead;
+          return;
+        }
+      }
+      segmentBytes_ = writer_.segments[nextHeapSegment_]->bytes;
+      segmentBytesLeft_ = writer_.segments[nextHeapSegment_]->Capacity;
+      nextHeapSegment_++;
+    }
+  }
+};
+
+class MOZ_RAII SegmentedStringBuilder {
+  struct Chunk {
+    enum class Kind : uint8_t {
+      CharsLatin1,
+      CharsTwoByte,
+      JSString,
+    };
+    Kind kind;
+    union {
+      size_t stringIndex;
+      size_t numChars;
+    };
+    static Chunk newCharsLatin1(size_t len) {
+      Chunk chunk;
+      chunk.kind = Kind::CharsLatin1;
+      chunk.numChars = len;
+      return chunk;
+    }
+    static Chunk newCharsTwoByte(size_t len) {
+      Chunk chunk;
+      chunk.kind = Kind::CharsTwoByte;
+      chunk.numChars = len;
+      return chunk;
+    }
+    static Chunk newString(size_t stringIndex) {
+      Chunk chunk;
+      chunk.kind = Kind::JSString;
+      chunk.stringIndex = stringIndex;
+      return chunk;
+    }
+  };
+
+  JSContext* cx_;
+  using ChunkVector = Vector<Chunk, 8, SystemAllocPolicy>;
+  ChunkVector chunks_;
+
+  SegmentedCharsWriter chars_;
+  JS::RootedVector<JSLinearString*> strings_;
+
+  size_t length_ = 0;
+
+  bool isTwoByte_ = false;
+  size_t chunkLength_ = 0;
+
+  static constexpr size_t MaxShortStringLength = 32;
+
+  template <typename CharT>
+  void copyResult(CharT* data);
+
+  template <typename CharT>
+  JSString* finishStringInternal();
+
+  [[nodiscard]] bool finishChunk() {
+    if (chunkLength_ == 0) {
+      return true;
+    }
+    if (isTwoByte_) {
+      if (!chunks_.append(Chunk::newCharsTwoByte(chunkLength_))) {
+        return false;
+      }
+    } else {
+      if (!chunks_.append(Chunk::newCharsLatin1(chunkLength_))) {
+        return false;
+      }
+    }
+    length_ += chunkLength_;
+    chunkLength_ = 0;
+    return true;
+  }
+
+  bool appendSlow(Latin1Char c) {
+    chunkLength_++;
+    if (isTwoByte_) {
+      char16_t ch = c;
+      return chars_.writeBytes(reinterpret_cast<uint8_t*>(&ch), sizeof(ch));
+    }
+    return chars_.writeBytes(&c, sizeof(c));
+  }
+  bool appendSlow(char16_t c) {
+    if (!isTwoByte_) {
+      if (!finishChunk()) {
+        return false;
+      }
+      isTwoByte_ = true;
+    }
+    chunkLength_++;
+    return chars_.writeBytes(reinterpret_cast<uint8_t*>(&c), sizeof(c));
+  }
+  bool appendSlow(const Latin1Char* chars, size_t len) {
+    if (isTwoByte_) {
+      for (size_t i = 0; i < len; i++) {
+        char16_t ch = chars[i];
+        if (!chars_.writeBytes(reinterpret_cast<uint8_t*>(&ch), sizeof(ch))) {
+          return false;
+        }
+      }
+    } else {
+      if (!chars_.writeBytes(chars, len * sizeof(JS::Latin1Char))) {
+        return false;
+      }
+    }
+    chunkLength_ += len;
+    return true;
+  }
+  bool appendSlow(const char16_t* chars, size_t len) {
+    if (!isTwoByte_) {
+      if (!finishChunk()) {
+        return false;
+      }
+      isTwoByte_ = true;
+    }
+    if (!chars_.writeBytes(reinterpret_cast<const uint8_t*>(chars),
+                           len * sizeof(char16_t))) {
+      return false;
+    }
+    chunkLength_ += len;
+    return true;
+  }
+  void inflateCharsFast(const Latin1Char* chars, size_t len) {
+    for (size_t i = 0; i < len; i++) {
+      char16_t ch = chars[i];
+      chars_.writeBytesFast(reinterpret_cast<uint8_t*>(&ch), sizeof(ch));
+    }
+  }
+
+ public:
+  explicit SegmentedStringBuilder(JSContext* cx);
+
+  bool empty() const { return length_ + chunkLength_ == 0; }
+  void clear() {
+    length_ = 0;
+    chunkLength_ = 0;
+    isTwoByte_ = false;
+    strings_.clear();
+    chunks_.clear();
+    chars_.clear();
+  }
+
+  JSString* finishString();
+
+  using TwoByteCharsVector = Vector<char16_t, 32>;
+  [[nodiscard]] bool copyData(TwoByteCharsVector& result);
+
+  [[nodiscard]] bool append(char16_t c) {
+    if (MOZ_LIKELY(isTwoByte_ && chars_.canWriteBytesFast(sizeof(char16_t)))) {
+      chars_.writeBytesFast(reinterpret_cast<uint8_t*>(&c), sizeof(c));
+      chunkLength_++;
+      return true;
+    }
+    return appendSlow(c);
+  }
+  [[nodiscard]] bool append(Latin1Char c) {
+    if (MOZ_LIKELY(chars_.canWriteBytesFast(sizeof(char16_t)))) {
+      if (isTwoByte_) {
+        char16_t ch = c;
+        chars_.writeBytesFast(reinterpret_cast<uint8_t*>(&ch), sizeof(ch));
+      } else {
+        chars_.writeBytesFast(&c, sizeof(c));
+      }
+      chunkLength_++;
+      return true;
+    }
+    return appendSlow(c);
+  }
+  [[nodiscard]] bool append(char c) { return append(Latin1Char(c)); }
+
+  [[nodiscard]] bool append(const Latin1Char* chars, size_t len) {
+    if (len == 0) {
+      return true;
+    }
+    size_t bytesRequired = isTwoByte_ ? len * sizeof(char16_t) : len;
+    if (MOZ_LIKELY(chars_.canWriteBytesFast(bytesRequired))) {
+      if (!isTwoByte_) {
+        chars_.writeBytesFast(chars, len);
+      } else {
+        inflateCharsFast(chars, len);
+      }
+      chunkLength_ += len;
+      return true;
+    }
+    return appendSlow(chars, len);
+  }
+  [[nodiscard]] bool append(const Latin1Char* begin, const Latin1Char* end) {
+    return append(begin, size_t(end - begin));
+  }
+  [[nodiscard]] bool append(const char16_t* chars, size_t len) {
+    if (len == 0) {
+      return true;
+    }
+    if (isTwoByte_ &&
+        MOZ_LIKELY(chars_.canWriteBytesFast(len * sizeof(char16_t)))) {
+      chars_.writeBytesFast(reinterpret_cast<const uint8_t*>(chars),
+                            len * sizeof(char16_t));
+      chunkLength_ += len;
+      return true;
+    }
+    return appendSlow(chars, len);
+  }
+  [[nodiscard]] bool append(const char16_t* begin, const char16_t* end) {
+    return append(begin, size_t(end - begin));
+  }
+
+  [[nodiscard]] bool append(JSLinearString* str) {
+    size_t len = str->length();
+    if (len <= MaxShortStringLength) {
+      JS::AutoCheckCannotGC nogc;
+      if (str->hasLatin1Chars()) {
+        return append(str->latin1Chars(nogc), len);
+      }
+      return append(str->twoByteChars(nogc), len);
+    }
+    if (!finishChunk()) {
+      return false;
+    }
+    length_ += len;
+    if (str->hasTwoByteChars()) {
+      isTwoByte_ = true;
+    }
+    size_t stringIndex = strings_.length();
+    if (!strings_.append(str)) {
+      return false;
+    }
+    return chunks_.append(Chunk::newString(stringIndex));
+  }
+  [[nodiscard]] bool append(JSString* str) {
+    JSLinearString* linear = str->ensureLinear(cx_);
+    if (!linear) {
+      return false;
+    }
+    return append(linear);
+  }
+
+  [[nodiscard]] bool append(const char* chars, size_t len) {
+    return append(reinterpret_cast<const Latin1Char*>(chars), len);
+  }
+
+  template <size_t ArrayLength>
+  [[nodiscard]] bool append(const char (&array)[ArrayLength]) {
+    return append(array, ArrayLength - 1); /* No trailing '\0'. */
+  }
+};
+
+extern bool ValueToStringBuilderSlow(JSContext* cx, const Value& v,
+                                     SegmentedStringBuilder& sb);
+
+inline bool ValueToStringBuilder(JSContext* cx, const Value& v,
+                                 SegmentedStringBuilder& sb) {
+  if (v.isString()) {
+    return sb.append(v.toString());
+  }
+
+  return ValueToStringBuilderSlow(cx, v, sb);
+}
+
+inline bool BooleanToStringBuilder(bool b, SegmentedStringBuilder& sb) {
+  return b ? sb.append("true") : sb.append("false");
+}
+
 } /* namespace js */
 
 #endif /* util_StringBuilder_h */

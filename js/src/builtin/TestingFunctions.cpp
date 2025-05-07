@@ -1090,8 +1090,7 @@ static bool WasmLazyTieringEnabled(JSContext* cx, unsigned argc, Value* vp) {
   bool ion = wasm::IonAvailable(cx);
 
   bool enabled =
-      baseline && ion &&
-      JS::Prefs::wasm_lazy_tiering() &&
+      baseline && ion && JS::Prefs::wasm_lazy_tiering() &&
       (JS::Prefs::wasm_lazy_tiering_synchronous() ||
        (CanUseExtraThreads() && jit::CanFlushExecutionContextForAllThreads()));
 
@@ -6280,7 +6279,7 @@ static bool JSONStringify(JSContext* cx, unsigned argc, Value* vp) {
 #undef MATCH
   }
 
-  JSStringBuilder sb(cx);
+  SegmentedStringBuilder sb(cx);
   if (!Stringify(cx, &value, nullptr, UndefinedValue(), sb, behavior)) {
     return false;
   }

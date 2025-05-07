@@ -29,6 +29,7 @@ class TaggedParserAtomIndex;
 
 class GlobalObject;
 class StringBuilder;
+class SegmentedStringBuilder;
 
 [[nodiscard]] extern bool InitRuntimeNumberState(JSRuntime* rt);
 
@@ -77,6 +78,9 @@ extern bool IsInteger(double d);
  */
 [[nodiscard]] extern bool NumberValueToStringBuilder(const Value& v,
                                                      StringBuilder& sb);
+
+[[nodiscard]] extern bool NumberValueToStringBuilder(
+    const Value& v, SegmentedStringBuilder& sb);
 
 extern JSLinearString* IndexToString(JSContext* cx, uint32_t index);
 

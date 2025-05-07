@@ -1844,6 +1844,25 @@ bool js::NumberValueToStringBuilder(const Value& v, StringBuilder& sb) {
   return sb.append(cstr, cstrlen);
 }
 
+bool js::NumberValueToStringBuilder(const Value& v,
+                                    SegmentedStringBuilder& sb) {
+  /* Convert to C-string. */
+  ToCStringBuf cbuf;
+  const char* cstr;
+  size_t cstrlen;
+  if (v.isInt32()) {
+    cstrlen = ::Int32ToCString(&cbuf, v.toInt32());
+    cstr = cbuf.sbuf;
+  } else {
+    cstr = NumberToCString(&cbuf, v.toDouble(), &cstrlen);
+  }
+  MOZ_ASSERT(cstr);
+  MOZ_ASSERT(cstrlen == strlen(cstr));
+
+  MOZ_ASSERT(cstrlen < std::size(cbuf.sbuf));
+  return sb.append(cstr, cstrlen);
+}
+
 template <typename CharT>
 inline double CharToNumber(CharT c) {
   if ('0' <= c && c <= '9') {

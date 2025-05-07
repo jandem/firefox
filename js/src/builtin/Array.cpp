@@ -1258,7 +1258,8 @@ static bool array_toSource(JSContext* cx, unsigned argc, Value* vp) {
 template <typename SeparatorOp>
 static bool ArrayJoinDenseKernel(JSContext* cx, SeparatorOp sepOp,
                                  Handle<NativeObject*> obj, uint64_t length,
-                                 StringBuilder& sb, uint32_t* numProcessed) {
+                                 SegmentedStringBuilder& sb,
+                                 uint32_t* numProcessed) {
   // This loop handles all elements up to initializedLength. If
   // length > initLength we rely on the second loop to add the
   // other elements.
@@ -1320,7 +1321,7 @@ static bool ArrayJoinDenseKernel(JSContext* cx, SeparatorOp sepOp,
 
 template <typename SeparatorOp>
 static bool ArrayJoinKernel(JSContext* cx, SeparatorOp sepOp, HandleObject obj,
-                            uint64_t length, StringBuilder& sb) {
+                            uint64_t length, SegmentedStringBuilder& sb) {
   // Step 6.
   uint32_t numProcessed = 0;
 
@@ -1425,10 +1426,7 @@ bool js::array_join(JSContext* cx, unsigned argc, Value* vp) {
   }
 
   // Step 5.
-  JSStringBuilder sb(cx);
-  if (sepstr->hasTwoByteChars() && !sb.ensureTwoByteChars()) {
-    return false;
-  }
+  SegmentedStringBuilder sb(cx);
 
   // The separator will be added |length - 1| times, reserve space for that
   // so that we don't have to unnecessarily grow the buffer.
@@ -1438,21 +1436,11 @@ bool js::array_join(JSContext* cx, unsigned argc, Value* vp) {
       ReportAllocationOverflow(cx);
       return false;
     }
-    CheckedInt<uint32_t> res =
-        CheckedInt<uint32_t>(seplen) * (uint32_t(length) - 1);
-    if (!res.isValid()) {
-      ReportAllocationOverflow(cx);
-      return false;
-    }
-
-    if (!sb.reserve(res.value())) {
-      return false;
-    }
   }
 
   // Various optimized versions of steps 6-7.
   if (seplen == 0) {
-    auto sepOp = [](StringBuilder&) { return true; };
+    auto sepOp = [](SegmentedStringBuilder&) { return true; };
     if (!ArrayJoinKernel(cx, sepOp, obj, length, sb)) {
       return false;
     }
@@ -1460,19 +1448,21 @@ bool js::array_join(JSContext* cx, unsigned argc, Value* vp) {
     char16_t c = sepstr->latin1OrTwoByteChar(0);
     if (c <= JSString::MAX_LATIN1_CHAR) {
       Latin1Char l1char = Latin1Char(c);
-      auto sepOp = [l1char](StringBuilder& sb) { return sb.append(l1char); };
+      auto sepOp = [l1char](SegmentedStringBuilder& sb) {
+        return sb.append(l1char);
+      };
       if (!ArrayJoinKernel(cx, sepOp, obj, length, sb)) {
         return false;
       }
     } else {
-      auto sepOp = [c](StringBuilder& sb) { return sb.append(c); };
+      auto sepOp = [c](SegmentedStringBuilder& sb) { return sb.append(c); };
       if (!ArrayJoinKernel(cx, sepOp, obj, length, sb)) {
         return false;
       }
     }
   } else {
     Handle<JSLinearString*> sepHandle = sepstr;
-    auto sepOp = [sepHandle](StringBuilder& sb) {
+    auto sepOp = [sepHandle](SegmentedStringBuilder& sb) {
       return sb.append(sepHandle);
     };
     if (!ArrayJoinKernel(cx, sepOp, obj, length, sb)) {

@@ -264,3 +264,123 @@ bool js::ValueToStringBuilderSlow(JSContext* cx, const Value& arg,
   MOZ_ASSERT(v.isUndefined());
   return sb.append(cx->names().undefined);
 }
+
+bool js::ValueToStringBuilderSlow(JSContext* cx, const Value& arg,
+                                  SegmentedStringBuilder& sb) {
+  RootedValue v(cx, arg);
+  if (!ToPrimitive(cx, JSTYPE_STRING, &v)) {
+    return false;
+  }
+
+  if (v.isString()) {
+    return sb.append(v.toString());
+  }
+  if (v.isNumber()) {
+    return NumberValueToStringBuilder(v, sb);
+  }
+  if (v.isBoolean()) {
+    return BooleanToStringBuilder(v.toBoolean(), sb);
+  }
+  if (v.isNull()) {
+    return sb.append(cx->names().null);
+  }
+  if (v.isSymbol()) {
+    JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr,
+                              JSMSG_SYMBOL_TO_STRING);
+    return false;
+  }
+  if (v.isBigInt()) {
+    RootedBigInt i(cx, v.toBigInt());
+    JSLinearString* str = BigInt::toString<CanGC>(cx, i, 10);
+    if (!str) {
+      return false;
+    }
+    return sb.append(str);
+  }
+  MOZ_ASSERT(v.isUndefined());
+  return sb.append(cx->names().undefined);
+}
+
+SegmentedStringBuilder::SegmentedStringBuilder(JSContext* cx)
+    : cx_(cx), strings_(cx) {}
+
+template <typename CharT>
+void SegmentedStringBuilder::copyResult(CharT* data) {
+  SegmentedCharsReader reader(chars_);
+  CharT* cursor = data;
+
+  for (auto& chunk : chunks_) {
+    if (chunk.kind == Chunk::Kind::JSString) {
+      JSLinearString* str = strings_[chunk.stringIndex];
+      MOZ_ASSERT_IF(str->hasTwoByteChars(), (std::is_same_v<CharT, char16_t>));
+      CopyChars(cursor, *str);
+      cursor += str->length();
+      continue;
+    }
+
+    if (std::is_same_v<CharT, char16_t> &&
+        chunk.kind == Chunk::Kind::CharsTwoByte) {
+      uint8_t* bytesCursor = reinterpret_cast<uint8_t*>(cursor);
+      reader.readBytes(chunk.numChars * sizeof(char16_t),
+                       [&](const uint8_t* bytes, size_t len) {
+                         std::copy_n(bytes, len, bytesCursor);
+                         bytesCursor += len;
+                       });
+      cursor += chunk.numChars;
+      continue;
+    }
+
+    MOZ_ASSERT(chunk.kind == Chunk::Kind::CharsLatin1);
+
+    reader.readBytes(chunk.numChars, [&](const uint8_t* bytes, size_t len) {
+      std::copy_n(bytes, len, cursor);
+      cursor += len;
+    });
+  }
+
+  MOZ_ASSERT(data + length_ == cursor);
+}
+
+template <typename CharT>
+JSString* SegmentedStringBuilder::finishStringInternal() {
+  StringChars<CharT> chars(cx_);
+  if (!chars.maybeAlloc(cx_, length_)) {
+    return nullptr;
+  }
+  {
+    JS::AutoCheckCannotGC nogc;
+    copyResult(chars.data(nogc));
+  }
+  return chars.template toStringDontDeflate<CanGC>(cx_, length_);
+}
+
+JSString* SegmentedStringBuilder::finishString() {
+  if (!finishChunk()) {
+    return nullptr;
+  }
+
+  if (length_ == 0) {
+    return cx_->names().empty_;
+  }
+
+  if (MOZ_UNLIKELY(!JSString::validateLength(cx_, length_))) {
+    return nullptr;
+  }
+
+  return isTwoByte_ ? finishStringInternal<char16_t>()
+                    : finishStringInternal<Latin1Char>();
+}
+
+bool SegmentedStringBuilder::copyData(TwoByteCharsVector& result) {
+  MOZ_ASSERT(result.empty());
+
+  if (!finishChunk()) {
+    return false;
+  }
+
+  if (!result.growByUninitialized(length_)) {
+    return false;
+  }
+  copyResult(result.begin());
+  return true;
+}
